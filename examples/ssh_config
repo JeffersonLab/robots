@@ -1,0 +1,32 @@
+# REVIEW ONLY: replace YOUR_JLAB_USERNAME; verify fingerprints at first connection.
+# Create ~/.ssh/jlab-workers with mode 0700 first.
+# Merge/review any existing `ifarm` stanza; do not blindly append this template.
+# Place these entries before broader matching entries in ~/.ssh/config.
+# The user's one authentication command is: ssh ifarm
+Host jlab-gateway
+    HostName login.jlab.org
+    User YOUR_JLAB_USERNAME
+    ControlMaster auto
+    ControlPath ~/.ssh/jlab-workers/%C
+    ControlPersist 8h
+    StrictHostKeyChecking ask
+    ForwardAgent no
+    ServerAliveInterval 30
+    ServerAliveCountMax 3
+
+Host ifarm jlab-ifarm2401
+    HostName ifarm2401.jlab.org
+Host jlab-ifarm2402
+    HostName ifarm2402.jlab.org
+Host ifarm jlab-ifarm2401 jlab-ifarm2402
+    User YOUR_JLAB_USERNAME
+    # Ordinary ssh handles both hops and their interactive prompts in one command.
+    # Automated `jlab-workers remote` only reuses an existing destination master.
+    ProxyJump jlab-gateway
+    ControlMaster auto
+    ControlPath ~/.ssh/jlab-workers/%C
+    ControlPersist 8h
+    StrictHostKeyChecking ask
+    ForwardAgent no
+    ServerAliveInterval 30
+    ServerAliveCountMax 3

@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.env
+.env.*
+*.key
+*.pem
+*.log
+config.local.*
+.jlab-workers/
+credentials/
+runtime/

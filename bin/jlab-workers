@@ -1,0 +1,473 @@
+#!/usr/bin/env python3
+"""Project-scoped Codex (default) and Claude workers; Python 3.9+, Linux remote."""
+import argparse
+import getpass
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import socket
+import stat
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+import warnings
+
+BASE = Path.home() / '.jlab-workers'
+ROOT = 'https://api.delphi.jlab.org'
+PROJECTS = ('femtomind', 'quantom')
+TMUX = ['tmux', '-L', 'jlab-workers']
+SCRIPT = str(Path(__file__).resolve())
+FARM_OUT_ROOT = Path('/farm_out')
+
+
+def fail(message):
+    raise SystemExit(message)
+
+
+def private(path):
+    if path.is_symlink():
+        fail('Refusing symlink directory.')
+    path.mkdir(mode=0o700, exist_ok=True)
+    st = path.stat()
+    if st.st_uid != os.getuid() or st.st_mode & 0o077:
+        fail('Private directories must be owned by you and mode 0700: ' + str(path))
+    return path
+
+
+def read_private(path):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd) as stream:
+        st = os.fstat(stream.fileno())
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+            fail('Expected a private regular file owned by you.')
+        return stream.read(65537)
+
+
+def write_new(path, data):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w') as stream:
+        stream.write(data)
+
+
+def load_config():
+    private(BASE)
+    return json.loads(read_private(BASE / 'config.json'))
+
+
+def get_key(project):
+    private(BASE)
+    private(BASE / 'credentials')
+    try:
+        key = read_private(BASE / 'credentials' / (project + '.key')).strip()
+    except FileNotFoundError:
+        fail('Missing ' + project + ' key. No alternative key will be used.')
+    if not key or len(key) > 8192 or any(c.isspace() for c in key):
+        fail('Invalid key format.')
+    return key
+
+
+def store_key(project):
+    private(BASE)
+    private(BASE / 'credentials')
+    if not sys.stdin.isatty():
+        fail('Use store-key yourself in an interactive terminal.')
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', getpass.GetPassWarning)
+        key = getpass.getpass('Project API key (hidden): ').strip()
+        again = getpass.getpass('Repeat (hidden): ').strip()
+    if key != again or not key or len(key) > 8192 or any(c.isspace() for c in key):
+        fail('Keys did not match or format was invalid.')
+    write_new(BASE / 'credentials' / (project + '.key'), key + '\n')
+    print('Key saved privately. Confirm its actual team with the administrator.')
+
+
+def clean_env():
+    # Neither a stale provider credential nor a cached routing override may win.
+    return {k: v for k, v in os.environ.items()
+            if not k.startswith(('ANTHROPIC_', 'CLAUDE_', 'CODEX_', 'OPENAI_', 'JLAB_'))}
+
+
+def worker_id(project, worker):
+    if not re.fullmatch(r'[a-z][a-z0-9-]{0,39}', worker):
+        fail('Worker must start with a letter and contain lowercase letters/digits/hyphens.')
+    return 'jlab-' + project + '-' + worker
+
+
+def host_check(cfg):
+    host = socket.gethostname().split('.')[0]
+    if host not in cfg['hosts']:
+        fail('Actual host is not in the configured pinned host list: ' + host)
+    return host
+
+
+def identity_path(name):
+    if not re.fullmatch(r'jlab-(femtomind|quantom)-[a-z][a-z0-9-]{0,39}', name):
+        fail('Invalid worker identity.')
+    private(BASE)
+    private(BASE / 'workers')
+    return BASE / 'workers' / (name + '.json')
+
+
+def identity(name):
+    return json.loads(read_private(identity_path(name)))
+
+
+def binary(cfg, engine):
+    exe = str(Path(cfg['binaries'][engine]).expanduser())
+    if not Path(exe).is_absolute() or not os.access(exe, os.X_OK):
+        fail('Configure an absolute executable path for ' + engine + '.')
+    return exe
+
+
+def tmux(*args, **kwargs):
+    return subprocess.run(TMUX + list(args), check=True, **kwargs)
+
+
+def runtime(name):
+    parent = private(Path('/var/tmp') / ('jlab-workers-' + str(os.getuid())))
+    return private(parent / name)
+
+
+def log_directory_grants(rec, cfg):
+    """Only explicitly configured, precreated user-owned iFarm log leaves."""
+    paths = cfg.get('worker_log_directories', {}).get(rec['tmux'], [])
+    if not isinstance(paths, list):
+        fail('Worker log directories must be a list.')
+    if paths and (rec['engine'] != 'codex' or not rec['slurm']):
+        fail('Scoped log grants require a Codex worker with explicit Slurm access.')
+    parent = FARM_OUT_ROOT / getpass.getuser()
+    grants = []
+    for value in paths:
+        if not isinstance(value, str):
+            fail('Log directory must be an absolute literal path.')
+        path = Path(value)
+        if (not path.is_absolute() or path.parent != parent or
+                not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,159}', path.name) or
+                path.is_symlink() or not path.is_dir()):
+            fail('Expected a precreated non-symlink log leaf under /farm_out/USER.')
+        st = path.stat()
+        if st.st_uid != os.getuid() or st.st_mode & 0o022:
+            fail('Log leaf must be user-owned and not group/world-writable.')
+        resolved = path.resolve(strict=True)
+        if resolved.parent != parent.resolve(strict=True):
+            fail('Log leaf resolves outside the user log directory.')
+        for grant in (str(path), str(resolved)):
+            if grant not in grants:
+                grants.append(grant)
+    return grants
+
+
+def launch_spec(rec, cfg, key, work_runtime):
+    engine, model = rec['engine'], rec['model']
+    env = clean_env()
+    env.update(JLAB_BILLING_PROJECT=rec['project'], JLAB_WORKER_ID=rec['worker'])
+    if engine == 'codex':
+        env.update(CODEX_HOME=str(work_runtime), JLAB_LITELLM_API_KEY=key)
+        # The selected credential remains outside the worker filesystem scope.
+        config = '\n'.join([
+            'model_provider = "jlab"', 'model = ' + json.dumps(model),
+            'approval_policy = "on-request"', 'default_permissions = "worker"',
+            '[model_providers.jlab]', 'name = "JLab LiteLLM"',
+            'base_url = "' + ROOT + '/v1"', 'wire_api = "responses"',
+            'env_key = "JLAB_LITELLM_API_KEY"', 'requires_openai_auth = false',
+            'supports_websockets = false', 'request_max_retries = 0',
+            'stream_max_retries = 0', '[permissions.worker.filesystem]',
+            '":minimal" = "read"', '":workspace_roots" = "write"',
+            # Standalone installs may live outside :minimal. Sandbox helpers link
+            # back to these binaries; permit only the resolved executable directory.
+            json.dumps(str(Path(binary(cfg, engine)).resolve().parent)) + ' = "read"',
+            json.dumps(str(work_runtime)) + ' = "write"',
+            json.dumps(str(BASE / 'credentials')) + ' = "deny"',
+            '[permissions.worker.network]', 'enabled = false', ''])
+        log_grants = log_directory_grants(rec, cfg)
+        if log_grants:
+            config = config.replace('[permissions.worker.network]',
+                '\n'.join(json.dumps(path) + ' = "write"' for path in log_grants)
+                + '\n[permissions.worker.network]')
+        # Explicit opt-in for the site's previously diagnosed Slurm dependencies.
+        if rec['slurm']:
+            config = config.replace('[permissions.worker.network]',
+                '"/var/lib/sss/mc" = "read"\n"/var/lib/sss/pipes/nss" = "read"\n'
+                '"/run/munge/munge.socket.2" = "read"\n'
+                '"/var/run/munge/munge.socket.2" = "read"\n[permissions.worker.network]')
+            config = config.replace('enabled = false', 'enabled = true')
+        # CLI overrides outrank any project-level provider settings.
+        command = [binary(cfg, engine), '--no-daemon', '-C', rec['cwd'], '--no-alt-screen',
+                   '-c', 'model_provider="jlab"', '-c', 'model=' + json.dumps(model),
+                   '-c', 'model_providers.jlab.base_url="' + ROOT + '/v1"',
+                   '-c', 'model_providers.jlab.env_key="JLAB_LITELLM_API_KEY"',
+                   '-c', 'model_providers.jlab.requires_openai_auth=false']
+        return command, env, ('config.toml', config)
+    env.update(ANTHROPIC_BASE_URL=ROOT, ANTHROPIC_AUTH_TOKEN=key,
+               ANTHROPIC_MODEL=model, ANTHROPIC_DEFAULT_OPUS_MODEL=model,
+               ANTHROPIC_DEFAULT_SONNET_MODEL=model, ANTHROPIC_DEFAULT_HAIKU_MODEL=model,
+               CLAUDE_CONFIG_DIR=str(work_runtime),
+               CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC='1')
+    # No bypass/auto-approval flags. Project/user settings are excluded from loading;
+    # administrator managed policy still applies. Workspace instructions still load.
+    command = [binary(cfg, engine), '--model', model, '--permission-mode', 'default',
+               '--setting-sources', 'user']
+    return command, env, ('settings.json', '{}\n')
+
+
+def start(args):
+    cfg = load_config()
+    host = host_check(cfg)
+    name = worker_id(args.project, args.worker)
+    cwd = Path(args.cwd).expanduser().resolve(strict=True)
+    if not cwd.is_dir():
+        fail('Workspace must be a directory.')
+    get_key(args.project)
+    binary(cfg, args.engine)
+    if not shutil.which('tmux'):
+        fail('tmux is required.')
+    model = args.model or cfg.get('models', {}).get(args.engine)
+    if not model or not isinstance(model, str) or model.startswith('REPLACE_'):
+        fail('Configure an exact allowed gateway model ID or pass --model.')
+    rec = dict(project=args.project, worker=args.worker, engine=args.engine,
+               model=model, host=host, cwd=str(cwd), tmux=name, slurm=args.slurm)
+    path = identity_path(name)
+    # Atomic shared-home identity claim prevents cross-host/tag/type replacement.
+    try:
+        write_new(path, json.dumps(rec, indent=2) + '\n')
+    except FileExistsError:
+        if identity(name) != rec:
+            fail('Existing identity differs. Inspect the original worker; no replacement started.')
+    # tmux atomically rejects an existing session, including a retained dead pane.
+    tmux('new-session', '-d', '-s', name, '-c', str(cwd),
+         sys.executable, SCRIPT, '_run', name, ';',
+         'set-option', '-w', '-t', '=' + name + ':', 'remain-on-exit', 'on', env=clean_env())
+    print(json.dumps({'registered': rec, 'status': 'starting; inspect status and terminal'}))
+
+
+def run(name):
+    rec, cfg = identity(name), load_config()
+    if host_check(cfg) != rec['host']:
+        fail('Worker belongs to another host.')
+    if not os.environ.get('TMUX'):
+        fail('Internal runner requires its named tmux session.')
+    actual = tmux('display-message', '-p', '#S', capture_output=True, text=True).stdout.strip()
+    if actual != name:
+        fail('Wrong tmux session.')
+    tmux('set-option', '-w', '-t', '=' + name + ':', 'remain-on-exit', 'on')
+    rt = runtime(name)
+    command, env, (filename, content) = launch_spec(rec, cfg, get_key(rec['project']), rt)
+    target = rt / filename
+    # Generated state is only rewritten within this tool's private host-local runtime.
+    if target.is_symlink():
+        fail('Refusing runtime config symlink.')
+    target.write_text(content)
+    target.chmod(0o600)
+    print(json.dumps(rec), flush=True)
+    print('Verify provider, permissions and readiness before sending a task.', flush=True)
+    result = subprocess.run(command, env=env, cwd=rec['cwd'])
+    print('Worker exited with code ' + str(result.returncode), flush=True)
+    return result.returncode
+
+
+def panes():
+    result = subprocess.run(TMUX + ['list-panes', '-a', '-F',
+        '#{session_name}\t#{pane_id}\t#{pane_dead}\t#{pane_dead_status}'],
+        capture_output=True, text=True)
+    if result.returncode:
+        # A missing server is normal; permission/server failures are not a zero count.
+        if 'no server running' in result.stderr or 'No such file' in result.stderr:
+            return {}
+        fail('Cannot inspect tmux server; worker count is unavailable.')
+    found = {}
+    for line in result.stdout.splitlines():
+        name, pane, dead, code = line.split('\t')
+        found.setdefault(name, []).append(dict(pane=pane, dead=dead == '1', exit_code=code))
+    return found
+
+
+def status():
+    host = host_check(load_config())
+    observed = panes()
+    records = []
+    private(BASE / 'workers')
+    for path in sorted((BASE / 'workers').glob('*.json')):
+        rec = identity(path.stem)
+        ps = observed.pop(rec['tmux'], []) if rec['host'] == host else []
+        state = ('other-host-unchecked' if rec['host'] != host else
+                 'absent' if not ps else 'exited' if all(p['dead'] for p in ps)
+                 else 'process-running-readiness-unknown')
+        records.append(dict(rec, state=state, panes=ps))
+    print(json.dumps(dict(host=host, workers=records, unmanaged_sessions=observed,
+        running_registered=sum(r['state'] == 'process-running-readiness-unknown' for r in records)), indent=2))
+
+
+def target_pane(project, worker):
+    name = worker_id(project, worker)
+    rec = identity(name)
+    if host_check(load_config()) != rec['host']:
+        fail('Connect to the worker\'s recorded host.')
+    ps = panes().get(name, [])
+    if len(ps) != 1 or ps[0]['dead']:
+        fail('Expected exactly one live worker pane; inspect status.')
+    return name, ps[0]['pane']
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args):
+        return None
+
+
+def api_get(project, route):
+    req = urllib.request.Request(ROOT + route, headers={'Authorization': 'Bearer ' + get_key(project)})
+    try:
+        with urllib.request.build_opener(NoRedirect).open(req, timeout=20) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as exc:
+        return {'unavailable': True, 'http_status': exc.code}
+    except (urllib.error.URLError, TimeoutError, ValueError):
+        return {'unavailable': True, 'reason': 'request-or-response-failed'}
+
+
+def usage(project, scope='key'):
+    data = api_get(project, '/key/info' if scope == 'key' else '/user/info')
+    if data.get('unavailable'):
+        print(json.dumps(dict(project=project, **data)))
+        return
+    info = data.get('info' if scope == 'key' else 'user_info')
+    if not isinstance(info, dict):
+        print(json.dumps(dict(project=project, unavailable=True, reason='unexpected-response-shape')))
+        return
+    # Never serialize the full response: key hashes, tokens, metadata may be present.
+    fields = ('key_alias', 'user_id', 'team_id', 'spend', 'max_budget', 'budget_duration',
+              'budget_reset_at', 'expires')
+    out = {field: info.get(field) if isinstance(info.get(field), (str, int, float, bool)) else None
+           for field in fields}
+    print(json.dumps(dict(project=project, scope='this-' + scope, **out), indent=2))
+
+
+def ssh_args(alias, interactive=False):
+    if not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.-]*', alias):
+        fail('Use a configured SSH alias, without options or user@ syntax.')
+    args = ['ssh', '-o', 'StrictHostKeyChecking=yes', '-o', 'ForwardAgent=no',
+            '-o', 'ConnectTimeout=15']
+    if not interactive:
+        args += ['-o', 'BatchMode=yes', '-o', 'ProxyCommand=false', '-o', 'ProxyJump=none']
+    return args
+
+
+def control_path(host):
+    ssh = ssh_args(host, True)
+    effective = subprocess.run(ssh + ['-G', host], check=True, capture_output=True, text=True)
+    paths = [line.split(' ', 1)[1] for line in effective.stdout.splitlines()
+             if line.startswith('controlpath ')]
+    if not paths or paths[0] == 'none':
+        fail('Configure a private SSH ControlPath first; see docs/SSH.md.')
+    parent = Path(paths[0]).expanduser().parent
+    st = parent.stat()
+    if parent.is_symlink() or st.st_uid != os.getuid() or st.st_mode & 0o077:
+        fail('SSH socket directory must be private and owned by you.')
+    return paths[0]
+
+
+def connect(host):
+    ssh = ssh_args(host, True) + ['-S', control_path(host)]
+    check = subprocess.run(ssh + ['-O', 'check', host], capture_output=True)
+    if check.returncode == 0:
+        print('Existing SSH master is available.')
+        return 0
+    return subprocess.call(ssh + ['-o', 'ControlMaster=auto', '-o', 'ControlPersist=8h', '-MNf', host])
+
+
+def remote(args):
+    cmd = list(args.command)
+    if cmd and cmd[0] == '--':
+        cmd.pop(0)
+    if not cmd or cmd[0] not in ('start', 'status', 'capture', 'attach', 'models', 'usage', 'check', 'store-key'):
+        fail('Specify a supported remote command after --.')
+    # Refuse any new network transport in automated commands: preflight alone has a race.
+    # %C includes ProxyJump on modern OpenSSH. Resolve BEFORE disabling transport,
+    # then pin the socket, otherwise the automated invocation could hash a new path.
+    ssh = ssh_args(args.host) + ['-S', control_path(args.host)]
+    subprocess.run(ssh + ['-O', 'check', args.host], check=True)
+    tty = ['-tt'] if cmd[0] in ('attach', 'store-key') else ['-T']
+    command = shlex.join(['.local/bin/jlab-workers'] + cmd)
+    raise SystemExit(subprocess.call(ssh + tty + [args.host, command]))
+
+
+def parser():
+    p = argparse.ArgumentParser(description=__doc__)
+    sub = p.add_subparsers(dest='action', required=True)
+    sub.add_parser('init')
+    sub.add_parser('status')
+    for action in ('store-key', 'check', 'models', 'usage'):
+        sp = sub.add_parser(action)
+        sp.add_argument('project', choices=PROJECTS)
+        if action == 'usage':
+            sp.add_argument('--scope', choices=('key', 'user'), default='key')
+    for action in ('start', 'attach', 'capture'):
+        sp = sub.add_parser(action)
+        sp.add_argument('project', choices=PROJECTS)
+        sp.add_argument('worker')
+        if action == 'start':
+            sp.add_argument('--engine', choices=('codex', 'claude'), default='codex')
+            sp.add_argument('--cwd', required=True)
+            sp.add_argument('--model')
+            sp.add_argument('--slurm', action='store_true', help='Enable Codex iFarm scheduler network/socket access')
+    sp = sub.add_parser('_run')
+    sp.add_argument('name')
+    sp = sub.add_parser('connect')
+    sp.add_argument('host')
+    sp = sub.add_parser('remote')
+    sp.add_argument('host')
+    sp.add_argument('command', nargs=argparse.REMAINDER)
+    return p
+
+
+def main():
+    args = parser().parse_args()
+    if args.action == 'init':
+        private(BASE)
+        for name in ('credentials', 'workers'):
+            private(BASE / name)
+        cfg = dict(hosts=['ifarm2401', 'ifarm2402'],
+                   binaries={'codex': str(Path.home() / '.local/bin/codex'),
+                             'claude': str(Path.home() / '.local/bin/claude')},
+                   models={'codex': 'azure/gpt-6-sol', 'claude': None})
+        write_new(BASE / 'config.json', json.dumps(cfg, indent=2) + '\n')
+        print('Created ~/.jlab-workers/config.json. Review binaries, pinned hosts and allowed model IDs.')
+    elif args.action == 'connect':
+        raise SystemExit(connect(args.host))
+    elif args.action == 'remote':
+        remote(args)
+    elif args.action == 'store-key':
+        store_key(args.project)
+    elif args.action == 'check':
+        get_key(args.project)
+        print('Private project key present; no server-side budget/team check performed.')
+    elif args.action == 'models':
+        data = api_get(args.project, '/v1/models')
+        print(json.dumps(data if data.get('unavailable') else
+            {'models': [m['id'] for m in data.get('data', []) if isinstance(m.get('id'), str)]}, indent=2))
+    elif args.action == 'usage':
+        usage(args.project, args.scope)
+    elif args.action == 'start':
+        start(args)
+    elif args.action == 'status':
+        status()
+    elif args.action == '_run':
+        raise SystemExit(run(args.name))
+    else:
+        name, pane = target_pane(args.project, args.worker)
+        if args.action == 'attach':
+            tmux('attach-session', '-t', '=' + name)
+        else:
+            tmux('capture-pane', '-p', '-t', pane, '-S', '-80')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (KeyboardInterrupt, EOFError):
+        sys.exit('Cancelled.')
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError, getpass.GetPassWarning) as exc:
+        sys.exit('Operation failed (' + type(exc).__name__ + '); no secret values reported.')
