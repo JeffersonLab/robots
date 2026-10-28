@@ -4,53 +4,31 @@ Keep planning and discussing your research with your local AI. Hand off coding,
 job monitoring and analysis to a remote AI worker using your project's JLab
 LiteLLM API key.
 
-## 1. Clone the repo on your laptop
+## Get started
 
-```sh
-git clone https://github.com/JeffersonLab/robots.git
-cd robots
-```
+Tell your local AI (with terminal access):
 
-## 2. Ask your local AI to prepare the setup
+> Clone https://github.com/JeffersonLab/robots and start the install protocol.
 
-Open this folder with a local AI that can use your terminal, and tell it:
+The AI follows [INSTALL.md](INSTALL.md). It asks for your JLab username, your
+billing project (FemtoMind or QuantOm), and whether you already have that project's
+API key. It prepares the software and SSH connection, then guides you through:
 
-> Read workflow.md and docs/SETUP.md. Set up this toolkit on my laptop and iFarm.
-> Prepare `ssh ifarm` for my JLab username, preserving my existing SSH settings
-> and workers. Guide me through authentication, then finish installing and
-> configuring the remote tools. Tell me when I can enter my project API key.
-> Use Codex workers by default.
+1. Running `ssh ifarm` in your terminal and completing JLab authentication.
+2. Entering your LiteLLM API key privately at the iFarm prompt, after installation:
 
-The AI handles the installation and connection setup. You handle login and
-private key entry. Prefer to do it yourself? Follow [detailed setup](docs/SETUP.md)
-and [SSH setup](docs/SSH.md).
+   ```sh
+   ~/.local/bin/jlab-workers store-key femtomind
+   ```
 
-## 3. Authenticate to iFarm
+The AI gives you the command for your selected project. The LiteLLM **API key**
+is separate from your SSH login; enter it only at the hidden prompt, never in chat.
+You do not need to choose SSH settings or run installation commands yourself.
 
-In your laptop terminal, run:
+Already cloned the repo? Open it with your local AI and say **“Start the install
+protocol.”** Prefer manual setup? See [installation details](docs/SETUP.md).
 
-```sh
-ssh ifarm
-```
-
-Complete the JLab authentication prompts and leave the connection open while your
-AI finishes setup. It can then reuse that connection. If authentication expires,
-run `ssh ifarm` again.
-
-## 4. Enter your project's LiteLLM API key
-
-Once the AI confirms installation is complete, run this **at the iFarm prompt**:
-
-```sh
-~/.local/bin/jlab-workers store-key femtomind
-```
-
-Enter your own administrator-issued key at the hidden prompt. This is a
-**LiteLLM API key**, separate from your SSH login. Do not paste it into the AI chat.
-The toolkit stores it in a private file on iFarm. Use `quantom` instead if you
-have a key issued for that project.
-
-## 5. Start a local project chat and hand off the heavy work
+## Hand off work from a local project chat
 
 In a new or existing local AI project chat, point the AI to this repo and say:
 

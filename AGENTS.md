@@ -1,5 +1,9 @@
 # Repository development and use
 
+- When asked to install, set up, onboard, or start the install protocol, follow
+  [INSTALL.md](INSTALL.md). Ask only for missing non-secret details, perform the
+  setup, and guide the user through interactive authentication and key entry.
+
 - Default to Codex workers. Use Claude Code only when explicitly requested.
 - Project and engine are independent; never fall back to another funding key.
 - Keep credentials, generated configuration, logs and research data out of Git.

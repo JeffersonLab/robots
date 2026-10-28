@@ -1,5 +1,8 @@
 # Detailed setup and command reference
 
+For guided installation, ask your local AI to follow [INSTALL.md](../INSTALL.md).
+The commands below are the implementation reference and manual alternative.
+
 A local coordinator controls project-funded AI workers on a pinned iFarm host.
 **Codex is the default. Claude Code is opt-in with `--engine claude`.**
 Each user installs their own FemtoMind/QuantOm virtual keys; the repository has

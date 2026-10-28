@@ -1,5 +1,7 @@
 # Reusable local/remote task workflow
 
+For first-time setup, follow [the install protocol](INSTALL.md) before dispatch.
+
 1. Read the project's AGENTS.md/CLAUDE.md and site resource/storage guidance. Identify
    the scientific owner and the authorized billing project. Use Codex unless the
    user explicitly requests Claude Code. Local coordinator reasoning uses the
@@ -77,16 +79,10 @@ login/interactive host. Do not start another person's worker under your Unix log
 
 ## User-facing onboarding script
 
-After cloning, the user can tell their local AI:
+The user can tell their local AI:
 
-> Read README.md and workflow.md. Install the toolkit locally and on my chosen
-> iFarm host. Preserve my existing SSH setup and active workers. Configure
-> `ssh ifarm` as the single login command through the JLab gateway to that pinned
-> host. Guide me through its authentication prompts and hidden project-key entry.
-> Verify connection reuse before launching a worker. Default to Codex; use Claude
-> only when I explicitly request it.
+> Clone https://github.com/JeffersonLab/robots and start the install protocol.
 
-The AI prepares the configuration and software; the user authenticates with
-`ssh ifarm` and privately enters the project API key once with `store-key`. Later
-tasks reuse both. Reauthentication uses the same `ssh ifarm` command. NERSC access
-is a separate site authentication step, only when the task needs it.
+Follow [INSTALL.md](INSTALL.md). Once installation is complete, use the task
+workflow above for new or existing project chats. Installation does not itself
+launch a paid worker, start a scientific job, or create a monitor.
